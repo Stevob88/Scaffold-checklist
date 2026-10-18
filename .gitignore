@@ -1,0 +1,9 @@
+node_modules
+dist
+dev-dist
+.env
+.env.local
+supabase/.secrets.local.json
+supabase/.temp
+*.log
+.DS_Store
