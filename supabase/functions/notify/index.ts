@@ -4,7 +4,7 @@
 //   snags_submitted { inspection_id }  site manager finished a check with snags -> scaffold company
 //   fix_submitted   { snag_id }        fix photo submitted -> site manager (approval or FYI)
 //   fix_reviewed    { snag_id }        site manager rejected a fix -> scaffold company
-//   test            {}                 sends a test to the caller
+//   test            { delay_s? }       sends a test to the caller, optionally after up to 30 s
 //   sweep           {}                 run by pg_cron: 48h overdue snags + scaffolds past their 7-day check
 //
 // Secrets: VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY, VAPID_SUBJECT, CRON_SECRET,
@@ -12,6 +12,8 @@
 
 import { createClient } from 'npm:@supabase/supabase-js@2';
 import webpush from 'npm:web-push@3.6.7';
+
+declare const EdgeRuntime: { waitUntil(p: Promise<unknown>): void };
 
 const db = createClient(Deno.env.get('SUPABASE_URL')!, Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!, {
   auth: { persistSession: false },
@@ -92,8 +94,10 @@ async function profilesById(ids: (string | null)[]): Promise<Profile[]> {
   return (data as Profile[]) ?? [];
 }
 
-async function sendPush(userIds: string[], msg: Message): Promise<number> {
-  if (!VAPID_PUBLIC || !VAPID_PRIVATE || userIds.length === 0) return 0;
+async function sendPush(userIds: string[], msg: Message): Promise<{ sent: number; devices: number; errors: string[] }> {
+  const errors: string[] = [];
+  if (!VAPID_PUBLIC || !VAPID_PRIVATE) return { sent: 0, devices: 0, errors: ['VAPID keys not set on the server'] };
+  if (userIds.length === 0) return { sent: 0, devices: 0, errors };
   const { data } = await db.from('push_subscriptions').select('*').in('user_id', [...new Set(userIds)]);
   const payload = JSON.stringify({ title: msg.title, body: msg.body, url: msg.path, tag: msg.tag });
   let sent = 0;
@@ -105,12 +109,18 @@ async function sendPush(userIds: string[], msg: Message): Promise<number> {
       });
       sent++;
     } catch (e) {
-      const code = (e as { statusCode?: number }).statusCode;
-      if (code === 404 || code === 410) await db.from('push_subscriptions').delete().eq('id', sub.id);
-      else console.error('push failed', code, (e as Error).message);
+      const err = e as { statusCode?: number; body?: string; message?: string };
+      const code = err.statusCode;
+      if (code === 404 || code === 410) {
+        await db.from('push_subscriptions').delete().eq('id', sub.id);
+        errors.push(`${new URL(sub.endpoint).host}: registration expired (${code}) - removed`);
+      } else {
+        console.error('push failed', code, err.message, err.body);
+        errors.push(`${new URL(sub.endpoint).host}: ${code ?? ''} ${err.body || err.message || 'failed'}`.trim());
+      }
     }
   }
-  return sent;
+  return { sent, devices: data?.length ?? 0, errors };
 }
 
 async function sendEmail(addresses: string[], msg: Message, appUrl: string): Promise<number> {
@@ -161,7 +171,7 @@ async function notify(
   );
   const email =
     opts.email === false ? 0 : await sendEmail([...people.map((p) => p.email), ...(opts.extraEmails ?? [])], msg, appUrl);
-  return { push, email };
+  return { push: push.sent, push_devices: push.devices, push_errors: push.errors, email };
 }
 
 const snagLine = (s: { location: string; description: string; scaffold_name?: string }, withScaffold = false) =>
@@ -396,13 +406,28 @@ Deno.serve(async (req) => {
         return json(await fixReviewed(body.snag_id));
       case 'test': {
         const settings = await getSettings();
-        return json(
-          await notify(
+        const delay = Math.min(30, Math.max(0, Number(body.delay_s) || 0));
+        const send = () =>
+          notify(
             [caller],
-            { title: 'Test notification', body: `Notifications are working for ${caller.email}.`, path: '/', tag: 'test' },
+            {
+              title: 'Test notification',
+              body: `Notifications are working for ${caller.email} (sent ${fmt(new Date().toISOString())}).`,
+              path: '/',
+              tag: `test-${Date.now()}`,
+            },
             settings,
-          ),
+          );
+        if (!delay) return json(await send());
+        // Reply straight away so the phone can be locked; the send carries on in the background.
+        const { count } = await db
+          .from('push_subscriptions')
+          .select('id', { count: 'exact', head: true })
+          .eq('user_id', caller.id);
+        EdgeRuntime.waitUntil(
+          new Promise((r) => setTimeout(r, delay * 1000)).then(send).then((r) => console.log('delayed test', JSON.stringify(r))),
         );
+        return json({ scheduled: delay, push_devices: count ?? 0 });
       }
       default:
         return json({ error: 'Unknown event' }, 400);

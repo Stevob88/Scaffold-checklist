@@ -17,16 +17,27 @@ export default function SettingsAdmin() {
 
   if (!form) return <div className="muted">Loading...</div>;
 
-  async function test() {
+  async function test(delay = 0) {
     setTesting(true);
     setTestMsg(null);
-    const r = await sendNotification('test');
+    const r = await sendNotification('test', delay ? { delay_s: String(delay) } : {});
     setTesting(false);
     if (r.error) return setTestMsg(`Failed: ${r.error}`);
+    const devices = r.push_devices ?? 0;
+    if (devices === 0) {
+      return setTestMsg(
+        'No devices have notifications turned on for your account. Open the app from the home screen icon on your phone and tap "Turn on notifications".',
+      );
+    }
+    if (r.scheduled) {
+      return setTestMsg(
+        `Sending to ${devices} device(s) in ${r.scheduled} seconds - lock your phone or go to the home screen now.`,
+      );
+    }
+    const problems = r.push_errors?.length ? ` Problems: ${r.push_errors.join('; ')}` : '';
     setTestMsg(
-      r.push
-        ? `Sent to ${r.push} device(s)${r.email ? ' and your email' : ''}.`
-        : `No devices have notifications turned on for your account yet${r.email ? ' (email sent)' : ''}. Use "Turn on notifications" at the top of the app on your phone.`,
+      `Sent to ${r.push ?? 0} of ${devices} device(s)${r.email ? ' and your email' : ''}.${problems} ` +
+        'Phones often hide notifications while the app is open - if nothing showed, try "Send in 10 seconds" and lock the phone.',
     );
   }
 
@@ -143,9 +154,14 @@ export default function SettingsAdmin() {
         New snags go to Scaffolder accounts (push) and the contracts manager email above. Overdue snags, fixes to approve
         and scaffolds past their {form.check_days}-day check come to admins.
       </p>
-      <button type="button" className="btn btn-secondary" onClick={() => void test()} disabled={testing}>
-        {testing ? 'Sending...' : 'Send me a test notification'}
-      </button>
+      <div className="row gap-sm wrap">
+        <button type="button" className="btn btn-secondary" onClick={() => void test()} disabled={testing}>
+          {testing ? 'Sending...' : 'Send me a test notification'}
+        </button>
+        <button type="button" className="btn btn-secondary" onClick={() => void test(10)} disabled={testing}>
+          Send in 10 seconds
+        </button>
+      </div>
       {testMsg && <div className="alert alert-info mt-sm">{testMsg}</div>}
     </form>
   );
