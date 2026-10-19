@@ -3,7 +3,7 @@ import type { Inspection, InspectionItem, SiteSettings, Snag } from './types';
 import { addHours, fmtCoords, fmtDateTime, mapsLink, plotsLabel, safeFileName } from './format';
 import { photoForPdf } from './photo';
 import { liftGrid, resultLabel, shortLift } from './lifts';
-import { closedSummary } from './snags';
+import { closedSummary, isSnagOverdue, snagRef } from './snags';
 
 const PAGE_W = 210;
 const PAGE_H = 297;
@@ -321,6 +321,261 @@ export async function buildInspectionPdf({ inspection, items, snags, settings, i
       M,
       PAGE_H - 7,
     );
+    doc.text(`Page ${p} of ${pages}`, PAGE_W - M, PAGE_H - 7, { align: 'right' });
+  }
+
+  return doc.output('blob');
+}
+
+interface SnagListInput {
+  snags: Snag[];
+  /** Plot numbers of each snag's inspection, keyed by inspection id. */
+  plotsByInspection: Map<string, string[]>;
+  /** Inspector name of each snag's inspection, keyed by inspection id. */
+  inspectorByInspection: Map<string, string>;
+  settings: SiteSettings | null;
+  /** e.g. "Open snags" - shown under the title. */
+  title: string;
+  onProgress?: (msg: string) => void;
+}
+
+export function snagListFileName(settings: SiteSettings | null, title: string): string {
+  const d = new Date().toISOString().slice(0, 10);
+  return safeFileName(`${title}_${settings?.site_name || 'Site'}_${d}`) + '.pdf';
+}
+
+type PdfPhoto = { dataUrl: string; width: number; height: number } | null;
+
+async function loadPdfPhoto(path: string | null): Promise<PdfPhoto> {
+  if (!path) return null;
+  try {
+    return await photoForPdf(path);
+  } catch {
+    return null;
+  }
+}
+
+/** Every snag passed in, grouped by plot, with its photo, comment and status. */
+export async function buildSnagListPdf({
+  snags,
+  plotsByInspection,
+  inspectorByInspection,
+  settings,
+  title,
+  onProgress,
+}: SnagListInput): Promise<Blob> {
+  const doc = new jsPDF({ unit: 'mm', format: 'a4' });
+  let y = M;
+  const ensure = (h: number) => {
+    if (y + h > PAGE_H - M - 6) {
+      doc.addPage();
+      y = M;
+    }
+  };
+
+  const plotsOf = (s: Snag) => plotsByInspection.get(s.inspection_id) ?? [];
+  const firstPlot = (s: Snag) =>
+    Math.min(...plotsOf(s).map((p) => parseInt(p, 10)).filter((n) => !Number.isNaN(n)), Infinity);
+  const sorted = [...snags].sort(
+    (a, b) =>
+      firstPlot(a) - firstPlot(b) ||
+      a.scaffold_name.localeCompare(b.scaffold_name, undefined, { numeric: true }) ||
+      new Date(a.created_at).getTime() - new Date(b.created_at).getTime(),
+  );
+
+  const open = snags.filter((s) => s.status === 'open').length;
+  const pending = snags.filter((s) => s.status === 'pending_approval').length;
+  const closed = snags.filter((s) => s.status === 'closed').length;
+
+  doc.setFillColor(31, 41, 55);
+  doc.rect(0, 0, PAGE_W, 28, 'F');
+  doc.setTextColor(255, 255, 255);
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(18);
+  doc.text('Snag List', M, 12);
+  doc.setFont('helvetica', 'normal');
+  doc.setFontSize(11);
+  doc.text(settings?.site_name || 'Site', M, 20);
+  doc.text(title, PAGE_W - M, 12, { align: 'right' });
+  doc.text(fmtDateTime(new Date().toISOString()), PAGE_W - M, 20, { align: 'right' });
+  y = 36;
+
+  doc.setTextColor(17, 24, 39);
+  doc.setFontSize(10);
+  const summary = [
+    `${snags.length} snag${snags.length === 1 ? '' : 's'}`,
+    open && `${open} open`,
+    pending && `${pending} awaiting approval`,
+    closed && `${closed} closed`,
+  ]
+    .filter(Boolean)
+    .join('  |  ');
+  doc.text(summary, M, y);
+  y += 8;
+
+  let lastGroup = '';
+  let n = 0;
+  for (let i = 0; i < sorted.length; i++) {
+    const s = sorted[i];
+    onProgress?.(`Adding snag ${i + 1} of ${sorted.length}...`);
+    const plots = plotsOf(s);
+    const plotLabel = plots.length ? plotsLabel(plots) : s.scaffold_name;
+    const group = `${plotLabel}|${s.scaffold_name}`;
+
+    const showFix = s.status !== 'open' && !!s.close_photo_path;
+    const [photo, fix] = await Promise.all([loadPdfPhoto(s.photo_path), showFix ? loadPdfPhoto(s.close_photo_path) : null]);
+
+    // Photos sit side by side (before / after) under the text, scaled to fit a box.
+    const innerW = CONTENT_W - 5;
+    const boxW = showFix ? (innerW - 6) / 2 : innerW * 0.6;
+    const boxH = 56;
+    const fit = (p: PdfPhoto) => {
+      if (!p) return { w: boxW, h: 30 };
+      const scale = Math.min(boxW / p.width, boxH / p.height);
+      return { w: p.width * scale, h: p.height * scale };
+    };
+    const pSize = fit(photo);
+    const fSize = showFix ? fit(fix) : { w: 0, h: 0 };
+    const photosH = Math.max(pSize.h, fSize.h) + (showFix ? 5 : 0);
+
+    doc.setFontSize(11);
+    const descLines = doc.splitTextToSize(s.description || '-', innerW) as string[];
+    const hasGps = s.latitude != null && s.longitude != null;
+    const meta: [string, string][] = [
+      ['Location', s.location || '-'],
+      ['Logged', `${fmtDateTime(s.taken_at ?? s.created_at)}${inspectorByInspection.get(s.inspection_id) ? ` by ${inspectorByInspection.get(s.inspection_id)}` : ''}`],
+    ];
+    if (s.status === 'closed') {
+      const how = closedSummary(s);
+      meta.push(['Closed', `${fmtDateTime(s.closed_at)} by ${s.closed_by_name ?? '-'}${how ? ` - ${how}` : ''}`]);
+    } else if (s.status === 'pending_approval') {
+      meta.push(['Fix sent', `${fmtDateTime(s.close_submitted_at)} by ${s.closed_by_name ?? '-'}`]);
+    } else {
+      meta.push(['Due', fmtDateTime(s.due_at)]);
+    }
+    if (s.close_note) meta.push(['Fix note', s.close_note]);
+    doc.setFontSize(9);
+    const metaLines = meta.map(([k, v]) => [k, doc.splitTextToSize(v, innerW - 20) as string[]] as const);
+    const metaH = metaLines.reduce((h, [, v]) => h + v.length * 4.4, 0) + (hasGps ? 4.4 : 0);
+    const blockH = 9 + descLines.length * 5.2 + 2 + metaH + 3 + photosH + 8;
+
+    if (group !== lastGroup) {
+      ensure(12 + blockH);
+      doc.setFillColor(31, 41, 55);
+      doc.roundedRect(M, y, CONTENT_W, 9, 1.5, 1.5, 'F');
+      doc.setTextColor(255, 255, 255);
+      doc.setFont('helvetica', 'bold');
+      doc.setFontSize(12);
+      doc.text(plotLabel, M + 3, y + 6.2);
+      // Show the scaffold name too when it says more than the plot numbers, e.g. "Apartments 135-143".
+      if (plots.length && /[a-z]/i.test(s.scaffold_name)) {
+        doc.setFont('helvetica', 'normal');
+        doc.setFontSize(10);
+        doc.text(s.scaffold_name, PAGE_W - M - 3, y + 6.2, { align: 'right' });
+      }
+      doc.setTextColor(17, 24, 39);
+      y += 13;
+      lastGroup = group;
+      n = 0;
+    } else {
+      ensure(blockH);
+    }
+    n++;
+
+    const top = y;
+    // Status colour strip down the left edge of each snag.
+    const status: [string, [number, number, number]] =
+      s.status === 'closed'
+        ? ['CLOSED', [21, 128, 61]]
+        : s.status === 'pending_approval'
+          ? ['AWAITING APPROVAL', [29, 78, 216]]
+          : isSnagOverdue(s)
+            ? ['OVERDUE', [185, 28, 28]]
+            : ['OPEN', [217, 119, 6]];
+    doc.setFillColor(...status[1]);
+    doc.rect(M, top, 1.5, blockH - 6, 'F');
+
+    const x = M + 5;
+    y += 4.5;
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(12);
+    doc.text(`${plotLabel} - Snag ${n}`, x, y);
+    doc.setFontSize(10);
+    doc.setTextColor(...status[1]);
+    doc.text(status[0], PAGE_W - M, y, { align: 'right' });
+    const statusW = doc.getTextWidth(status[0]);
+    doc.setTextColor(107, 114, 128);
+    doc.setFont('helvetica', 'normal');
+    doc.setFontSize(8);
+    doc.text(snagRef(s), PAGE_W - M - statusW - 4, y, { align: 'right' });
+    doc.setTextColor(17, 24, 39);
+    y += 6;
+
+    doc.setFont('helvetica', 'normal');
+    doc.setFontSize(11);
+    doc.text(descLines, x, y);
+    y += descLines.length * 5.2 + 1;
+
+    doc.setFontSize(9);
+    for (const [k, v] of metaLines) {
+      doc.setFont('helvetica', 'bold');
+      doc.setTextColor(75, 85, 99);
+      doc.text(k, x, y);
+      doc.setFont('helvetica', 'normal');
+      doc.setTextColor(17, 24, 39);
+      doc.text(v, x + 20, y);
+      y += v.length * 4.4;
+    }
+    if (hasGps) {
+      doc.setFont('helvetica', 'bold');
+      doc.setTextColor(75, 85, 99);
+      doc.text('Map', x, y);
+      doc.setFont('helvetica', 'normal');
+      doc.setTextColor(37, 99, 235);
+      doc.textWithLink('Open in Google Maps', x + 20, y, { url: mapsLink(s.latitude!, s.longitude!) });
+      doc.setTextColor(17, 24, 39);
+      y += 4.4;
+    }
+    y += 1;
+
+    const drawPhoto = (p: PdfPhoto, size: { w: number; h: number }, px: number, caption: string | null) => {
+      if (p) doc.addImage(p.dataUrl, 'JPEG', px, y, size.w, size.h);
+      else {
+        doc.setFillColor(243, 244, 246);
+        doc.rect(px, y, size.w, size.h, 'F');
+        doc.setFontSize(9);
+        doc.setTextColor(107, 114, 128);
+        doc.text('No photo', px + size.w / 2, y + size.h / 2 + 1, { align: 'center' });
+        doc.setTextColor(17, 24, 39);
+      }
+      if (caption) {
+        doc.setFontSize(8);
+        doc.setTextColor(107, 114, 128);
+        doc.text(caption, px, y + size.h + 3.5);
+        doc.setTextColor(17, 24, 39);
+      }
+    };
+    drawPhoto(photo, pSize, x, showFix ? 'Snag' : null);
+    if (showFix) drawPhoto(fix, fSize, x + boxW + 6, 'Fix');
+
+    y = top + blockH - 3;
+    doc.setDrawColor(229, 231, 235);
+    doc.line(M, y, PAGE_W - M, y);
+    y += 4;
+  }
+
+  if (sorted.length === 0) {
+    doc.setFontSize(11);
+    doc.text('No snags.', M, y);
+  }
+
+  const pages = doc.getNumberOfPages();
+  for (let p = 1; p <= pages; p++) {
+    doc.setPage(p);
+    doc.setFont('helvetica', 'normal');
+    doc.setFontSize(8);
+    doc.setTextColor(107, 114, 128);
+    doc.text(`${settings?.site_name || 'Site'} - ${title}`, M, PAGE_H - 7);
     doc.text(`Page ${p} of ${pages}`, PAGE_W - M, PAGE_H - 7, { align: 'right' });
   }
 

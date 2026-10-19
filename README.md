@@ -15,6 +15,8 @@ Works on iPhone, iPad and computer (it's a web app you can add to the home scree
   date/time, GPS coordinates, plot and inspector are burned into the image.
 - **Send report** - PDF with photos and Google Maps links. On iPhone/iPad "Share PDF" opens the share sheet so you can
   pick Mail or WhatsApp with the PDF attached. There's also an Email button and a WhatsApp text message button.
+- **Export snags to PDF** - on the Snags page, Export PDF builds a clean list of the snags in the current filter (Open,
+  Overdue, Closed, All...) grouped by plot, each with its photo, comment, location, status and fix photo if closed.
 - **48 hour tracking** - the clock starts when the report is sent; overdue snags show in red. Snags are closed with an
   optional geo-tagged "fixed" photo.
 - **Multiple users** - Admin, Inspector, Viewer (read only), Scaffolder (sees and closes snags only). New sign-ups are

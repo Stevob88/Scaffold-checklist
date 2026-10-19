@@ -8,6 +8,8 @@ import CloseSnagModal from '../components/CloseSnagModal';
 import { FIX_QUEUE_EVENT } from '../lib/fixQueue';
 import { sendNotification } from '../lib/notify';
 import { isSnagOverdue } from '../lib/snags';
+import { buildSnagListPdf, snagListFileName } from '../lib/pdf';
+import { canShareFiles, downloadBlob, shareFile } from '../lib/share';
 
 type Filter = 'open' | 'overdue' | 'approval' | 'closed' | 'all';
 const FILTERS: { id: Filter; label: string }[] = [
@@ -20,7 +22,7 @@ const FILTERS: { id: Filter; label: string }[] = [
 const STATUS_ORDER: Record<Snag['status'], number> = { pending_approval: 0, open: 1, closed: 2 };
 
 export default function Snags() {
-  const { canFix, isAdmin, isScaffolder } = useAuth();
+  const { canFix, isAdmin, isScaffolder, settings } = useAuth();
   const [params, setParams] = useSearchParams();
   const filter = (FILTERS.find((f) => f.id === params.get('filter'))?.id ?? 'open') as Filter;
   const [snags, setSnags] = useState<Snag[]>([]);
@@ -28,6 +30,7 @@ export default function Snags() {
   const [error, setError] = useState<string | null>(null);
   const [closing, setClosing] = useState<Snag | null>(null);
   const [, setTick] = useState(0);
+  const [exporting, setExporting] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     const { data } = await supabase.from('snags').select('*').order('created_at', { ascending: false });
@@ -81,10 +84,52 @@ export default function Snags() {
     void sendNotification('fix_reviewed', { snag_id: snag.id });
   }
 
+  async function exportPdf() {
+    setError(null);
+    setExporting('Loading plots...');
+    try {
+      const ids = [...new Set(visible.map((s) => s.inspection_id))];
+      const plotsByInspection = new Map<string, string[]>();
+      const inspectorByInspection = new Map<string, string>();
+      if (ids.length > 0) {
+        const { data, error: err } = await supabase
+          .from('inspections')
+          .select('id, plot_numbers, inspector_name')
+          .in('id', ids);
+        if (err) throw err;
+        for (const i of (data ?? []) as { id: string; plot_numbers: string[]; inspector_name: string }[]) {
+          plotsByInspection.set(i.id, i.plot_numbers ?? []);
+          inspectorByInspection.set(i.id, i.inspector_name);
+        }
+      }
+      const title = `${FILTERS.find((f) => f.id === filter)?.label ?? 'All'} snags`;
+      const pdf = await buildSnagListPdf({
+        snags: visible,
+        plotsByInspection,
+        inspectorByInspection,
+        settings,
+        title,
+        onProgress: setExporting,
+      });
+      const fileName = snagListFileName(settings, title);
+      const outcome = canShareFiles()
+        ? await shareFile(pdf, fileName, `${title}${settings?.site_name ? ` - ${settings.site_name}` : ''}`, '')
+        : 'unsupported';
+      if (outcome === 'unsupported') downloadBlob(pdf, fileName);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Could not build PDF');
+    } finally {
+      setExporting(null);
+    }
+  }
+
   return (
     <div>
       <div className="page-head">
         <h1>{isScaffolder ? 'Snags to close' : 'Snags'}</h1>
+        <button className="btn btn-secondary btn-sm" onClick={() => void exportPdf()} disabled={!!exporting || visible.length === 0}>
+          {exporting ?? '📄 Export PDF'}
+        </button>
       </div>
       {isScaffolder && (
         <p className="muted small">
